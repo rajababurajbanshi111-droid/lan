@@ -7581,6 +7581,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   const media = new MediaManager(webrtc);
   const diagnostics = new DiagnosticsEngine(webrtc);
   const classroom = new ClassroomManager(signaling, webrtc, router);
+  window.classroom = classroom;
+  window.signaling = signaling;
+  window.webrtc = webrtc;
+  window.router = router;
   const monitoring = new StudentMonitoringEngine(webrtc, router);
 
   // Whiteboards: Standalone & Screen Annotation Overlay
