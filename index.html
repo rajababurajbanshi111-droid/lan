@@ -2439,7 +2439,7 @@ body {
                 </h4>
                 <div style="display: flex; gap: 0.5rem; align-items: center;">
                   <label style="display: flex; align-items: center; gap: 0.35rem; font-size: 0.75rem; color: var(--accent-cyan); cursor: pointer; margin-right: 0.25rem;">
-                    <input type="checkbox" id="teacherAutoApproveCheck" checked style="cursor: pointer;">
+                    <input type="checkbox" id="teacherAutoApproveCheck" style="cursor: pointer;">
                     <span>Auto-Approve</span>
                   </label>
                   <button class="btn btn-success" style="padding: 0.35rem 0.65rem; font-size: 0.75rem;" id="approveAllBtn">Approve All</button>
@@ -4272,31 +4272,26 @@ class WebRTCManager {
     // Configure transceivers upfront so SDP contains m=video and m=audio lines
     // If local screen/audio tracks already exist, bind them synchronously into transceivers!
     try {
-      if (pc.addTransceiver) {
-        if (isInitiator) {
-          let hasVideo = false;
-          let hasAudio = false;
+      if (pc.addTransceiver && isInitiator) {
+        let hasVideo = false;
+        let hasAudio = false;
 
-          // Synchronously bind any active presenter streams (Screen Share / Mic)
-          this.localStreams.forEach((stream) => {
-            stream.getTracks().forEach((track) => {
-              if (track.kind === 'video' && !hasVideo) {
-                pc.addTransceiver(track, { direction: 'sendrecv', streams: [stream] });
-                hasVideo = true;
-              } else if (track.kind === 'audio' && !hasAudio) {
-                pc.addTransceiver(track, { direction: 'sendrecv', streams: [stream] });
-                hasAudio = true;
-              }
-            });
+        // Synchronously bind any active presenter streams (Screen Share / Mic)
+        this.localStreams.forEach((stream) => {
+          stream.getTracks().forEach((track) => {
+            if (track.kind === 'video' && !hasVideo) {
+              pc.addTransceiver(track, { direction: 'sendrecv', streams: [stream] });
+              hasVideo = true;
+            } else if (track.kind === 'audio' && !hasAudio) {
+              pc.addTransceiver(track, { direction: 'sendrecv', streams: [stream] });
+              hasAudio = true;
+            }
           });
+        });
 
-          // Add empty transceivers as placeholders if screen/mic hasn't started yet
-          if (!hasVideo) pc.addTransceiver('video', { direction: 'sendrecv' });
-          if (!hasAudio) pc.addTransceiver('audio', { direction: 'sendrecv' });
-        } else {
-          pc.addTransceiver('video', { direction: 'recvonly' });
-          pc.addTransceiver('audio', { direction: 'recvonly' });
-        }
+        // Add empty transceivers as placeholders if screen/mic hasn't started yet
+        if (!hasVideo) pc.addTransceiver('video', { direction: 'sendrecv' });
+        if (!hasAudio) pc.addTransceiver('audio', { direction: 'sendrecv' });
       }
     } catch (e) {
       console.warn(`[WebRTC] Transceiver setup note for peer ${peerId}:`, e);
@@ -4638,9 +4633,9 @@ class WebRTCManager {
           if (pc.getTransceivers) {
             const transceivers = pc.getTransceivers();
             for (const t of transceivers) {
-              const kind = (t.receiver && t.receiver.track && t.receiver.track.kind) ||
-                           (t.sender && t.sender.track && t.sender.track.kind);
-              if (kind === track.kind) {
+              const currentTrack = (t.sender && t.sender.track) || (t.receiver && t.receiver.track);
+              const kind = currentTrack ? currentTrack.kind : null;
+              if (kind === track.kind || (t.sender && !currentTrack)) {
                 if (t.sender) {
                   t.direction = 'sendrecv';
                   t.sender.replaceTrack(track).catch((err) => {
@@ -4843,6 +4838,11 @@ class SignalingManager {
     this.onRoomTerminated = null;
     this.onBinaryMedia = null;
     this.onFileControl = null;
+    this.onRaiseHand = null;
+    this.onReaction = null;
+    this.onStreamStarted = null;
+    this.onWbStroke = null;
+    this.onWbClear = null;
   }
 
   // =========================================================================
@@ -5180,8 +5180,11 @@ class SignalingManager {
         this.ws.send(subStudent);
         this.ws.send(subBcast);
         topic = `smartclassroom_v1/${room}/teacher`;
+      } else if (messageObj.type === 'chat_message' || messageObj.type === 'reaction' || messageObj.type === 'announcement' || messageObj.type === 'stream_started' || messageObj.type === 'wb_stroke' || messageObj.type === 'wb_clear') {
+        // Broadcasts delivered to all participants (teacher + students)
+        topic = `smartclassroom_v1/${room}/broadcast`;
       } else if (this.role === 'student') {
-        // Any message sent by student (signal_answer, signal_candidate, leave) routes directly to teacher!
+        // Direct student-to-teacher messages (signal_answer, signal_candidate, raise_hand, student_left)
         topic = `smartclassroom_v1/${room}/teacher`;
       } else if (messageObj.recipientId) {
         // Teacher sending directly to an individual student (signal_offer, signal_candidate, approve, kick)
@@ -5281,6 +5284,26 @@ class SignalingManager {
 
       case 'chat_message':
         if (this.onChatMessage) this.onChatMessage(msg);
+        break;
+
+      case 'raise_hand':
+        if (this.onRaiseHand) this.onRaiseHand(msg);
+        break;
+
+      case 'reaction':
+        if (this.onReaction) this.onReaction(msg);
+        break;
+
+      case 'stream_started':
+        if (this.onStreamStarted) this.onStreamStarted(msg);
+        break;
+
+      case 'wb_stroke':
+        if (this.onWbStroke) this.onWbStroke(msg);
+        break;
+
+      case 'wb_clear':
+        if (this.onWbClear) this.onWbClear(msg);
         break;
 
       case 'permission_change':
@@ -5611,6 +5634,9 @@ class ScreenShareManager {
    */
   startSfuRelayStream() {
     if (!this.signalingManager || !this.activeStream) return;
+    // In Serverless Public Broker mode, screen streaming is 100% direct WebRTC peer-to-peer.
+    // Do NOT send raw binary frames to MQTT broker as it violates MQTT 3.1.1 framing!
+    if (this.signalingManager.isMqttMode) return;
     this.stopSfuRelayStream();
 
     try {
@@ -5718,8 +5744,9 @@ window.ScreenShareManager = ScreenShareManager;
  */
 
 class DataChannelRouter {
-  constructor(webrtcManager) {
+  constructor(webrtcManager, signalingManager = null) {
     this.webrtcManager = webrtcManager;
+    this.signalingManager = signalingManager;
 
     // Listeners for incoming payloads
     this.onChatMessage = null;
@@ -5840,7 +5867,15 @@ class DataChannelRouter {
         timestamp: Date.now()
       }
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'chat_message',
+        payload: packet.payload
+      });
+    }
     return packet.payload;
   }
 
@@ -5852,7 +5887,15 @@ class DataChannelRouter {
       type: 'whiteboard_stroke',
       payload: strokeData
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'wb_stroke',
+        payload: strokeData
+      });
+    }
   }
 
   /**
@@ -5860,7 +5903,12 @@ class DataChannelRouter {
    */
   broadcastWhiteboardClear() {
     const packet = { type: 'whiteboard_clear' };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({ type: 'wb_clear' });
+    }
   }
 
   /**
@@ -5877,7 +5925,9 @@ class DataChannelRouter {
         timestamp: Date.now()
       }
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
   }
 
   /**
@@ -5894,7 +5944,15 @@ class DataChannelRouter {
         timestamp: Date.now()
       }
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'announcement',
+        payload: packet.payload
+      });
+    }
     return packet.payload;
   }
 
@@ -5906,8 +5964,17 @@ class DataChannelRouter {
       type: 'permission_update',
       payload: permissions
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'permission_change',
+        permissions: permissions
+      });
+    }
   }
+
   /**
    * Broadcasts student hand raise toggle
    */
@@ -5915,13 +5982,22 @@ class DataChannelRouter {
     const packet = {
       type: 'raise_hand',
       payload: {
+        id: SecurityManager.generateUUID(),
         studentId: studentId,
         studentName: studentName,
         isRaised: isRaised,
         timestamp: Date.now()
       }
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'raise_hand',
+        payload: packet.payload
+      });
+    }
     return packet.payload;
   }
 
@@ -5932,12 +6008,21 @@ class DataChannelRouter {
     const packet = {
       type: 'reaction',
       payload: {
+        id: SecurityManager.generateUUID(),
         emoji: emoji,
         sender: studentName,
         timestamp: Date.now()
       }
     };
-    this.webrtcManager.sendData(JSON.stringify(packet));
+    if (this.webrtcManager) {
+      this.webrtcManager.sendData(JSON.stringify(packet));
+    }
+    if (this.signalingManager && this.signalingManager.isConnected) {
+      this.signalingManager.send({
+        type: 'reaction',
+        payload: packet.payload
+      });
+    }
     return packet.payload;
   }
 }
@@ -7645,7 +7730,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const storage = window.storageManager;
   const webrtc = new WebRTCManager();
   const signaling = window.signalingManager;
-  const router = new DataChannelRouter(webrtc);
+  const router = new DataChannelRouter(webrtc, signaling);
   const screenShare = new ScreenShareManager(webrtc, signaling);
   const fileTransfer = new FileTransferManager(webrtc, router, signaling);
   const media = new MediaManager(webrtc);
@@ -8217,6 +8302,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       teacherAudioStatusText.textContent = hasAudio ? 'Audio: Active' : 'Video Only';
 
       showToast('Screen broadcasting active to classroom!', 'success');
+      if (signaling && signaling.isConnected) {
+        signaling.send({ type: 'stream_started', hasAudio: hasAudio });
+      }
     } catch (err) {
       if (err.name !== 'NotAllowedError') {
         showToast(`Screen share error: ${err.message}`, 'error');
@@ -8231,6 +8319,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     teacherStageControls.style.display = 'none';
     teacherSidebarScreenDot.style.display = 'none';
     showToast('Screen broadcasting stopped.', 'info');
+    if (signaling && signaling.isConnected) {
+      signaling.send({ type: 'stream_stopped' });
+    }
   });
 
   teacherPauseShareBtn.addEventListener('click', () => {
@@ -8337,14 +8428,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     console.log('[App] Remote track received:', track.kind, 'from presenter:', peerId);
-    if (!studentRemoteVideo.srcObject) {
-      studentRemoteVideo.srcObject = new MediaStream();
+    if (stream && stream.getTracks().length > 0) {
+      studentRemoteVideo.srcObject = stream;
+    } else {
+      if (!studentRemoteVideo.srcObject) {
+        studentRemoteVideo.srcObject = new MediaStream();
+      }
+      const existing = studentRemoteVideo.srcObject.getTracks().find((t) => t.kind === track.kind);
+      if (existing) {
+        studentRemoteVideo.srcObject.removeTrack(existing);
+      }
+      studentRemoteVideo.srcObject.addTrack(track);
     }
-    const existing = studentRemoteVideo.srcObject.getTracks().find((t) => t.kind === track.kind);
-    if (existing) {
-      studentRemoteVideo.srcObject.removeTrack(existing);
-    }
-    studentRemoteVideo.srcObject.addTrack(track);
 
     classroom.isSessionActive = true;
     if (classroom.sessionCode) {
@@ -8372,14 +8467,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   };
 
-  // WebRTC Video Stall Watcher (Seamless Fallback to SFU if WebRTC Stalls)
+  // WebRTC Video Stall Watcher (Only fallback to SFU if running companion Node SFU server, never in serverless mode)
   studentRemoteVideo.addEventListener('waiting', () => {
+    if (signaling && signaling.isMqttMode) return;
     setTimeout(() => {
-      if (studentRemoteVideo.readyState < 2 && currentStreamEngine === 'webrtc') {
+      if (studentRemoteVideo.readyState < 2 && currentStreamEngine === 'webrtc' && !(signaling && signaling.isMqttMode)) {
         console.warn('[App] WebRTC stream stalled. Falling back to SFU relay.');
         setStreamEngine('sfu');
       }
-    }, 1800);
+    }, 4000);
   });
 
   // Classroom SFU Binary Media Receiver (High Efficiency Fallback Across Any Firewall/NAT)
@@ -8741,8 +8837,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   approveAllBtn.addEventListener('click', () => classroom.approveAllPending());
   rejectAllBtn.addEventListener('click', () => classroom.rejectAllPending());
 
-  // --- 12. Chat & Announcements ---
+  // --- 12. Chat & Announcements (Dual-Path WebRTC DataChannel + Real-Time Signaling) ---
+  const seenMessageIds = new Set();
   function appendChatMessage(msg, isSelf = false) {
+    if (!msg) return;
+    if (msg.id && seenMessageIds.has(msg.id)) return;
+    if (msg.id) seenMessageIds.add(msg.id);
+
     const tBox = chatMessageLog;
     const sBox = studentChatLog;
 
@@ -8751,7 +8852,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const meta = document.createElement('div');
     meta.style.cssText = 'font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.2rem;';
-    const timeStr = new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const timeStr = new Date(msg.timestamp || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     meta.textContent = `${msg.sender} (${msg.role || 'student'}) • ${timeStr}`;
 
     const isTeacher = msg.role === 'teacher';
@@ -8795,16 +8896,24 @@ document.addEventListener('DOMContentLoaded', async () => {
   studentChatSendBtn.addEventListener('click', sendChatFromStudent);
   studentChatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendChatFromStudent(); });
 
-  router.onChatMessage = (peerId, payload) => {
+  // Dual-Channel Chat Hook (Receives from WebRTC DataChannel & Signaling Fallback)
+  router.onChatMessage = (peerId, payload) => handleIncomingChat(payload);
+  signaling.onChatMessage = (msg) => {
+    if (msg.senderId !== signaling.clientId && msg.payload) {
+      handleIncomingChat(msg.payload);
+    }
+  };
+
+  function handleIncomingChat(payload) {
     appendChatMessage(payload, false);
     if (currentView === 'teacher' && currentTeacherTab !== 'chat') {
       teacherUnreadChat++;
       teacherChatBadge.style.display = 'inline-block';
       teacherChatBadge.textContent = teacherUnreadChat;
     }
-  };
+  }
 
-  // Announcements
+  // Announcements (Dual-Channel Delivery)
   teacherBroadcastBtn.addEventListener('click', () => {
     const text = teacherAnnouncementInput.value.trim();
     if (!text) return;
@@ -8813,22 +8922,31 @@ document.addEventListener('DOMContentLoaded', async () => {
     teacherAnnouncementInput.value = '';
   });
 
-  router.onAnnouncement = (peerId, ann) => {
+  const seenAnnouncementIds = new Set();
+  function handleIncomingAnnouncement(ann) {
+    if (!ann || !ann.text) return;
+    if (ann.id && seenAnnouncementIds.has(ann.id)) return;
+    if (ann.id) seenAnnouncementIds.add(ann.id);
+
     studentPinnedAnnouncement.style.display = 'block';
     studentPinnedText.textContent = ann.text;
 
     const item = document.createElement('div');
     item.style.cssText = 'background: rgba(0, 240, 255, 0.08); border: 1px solid var(--border-active); border-radius: var(--radius-sm); padding: 0.65rem 0.85rem;';
     item.innerHTML = `
-      <div style="font-weight: 700; color: var(--accent-cyan); font-size: 0.82rem;">${ann.title}</div>
+      <div style="font-weight: 700; color: var(--accent-cyan); font-size: 0.82rem;">${ann.title || 'Teacher Announcement'}</div>
       <div style="font-size: 0.84rem; margin-top: 0.2rem;">${ann.text}</div>
     `;
     studentAnnouncementsList.prepend(item);
     showToast(`📢 Announcement: ${ann.text}`, 'info');
-  };
+  }
 
-  // DataChannel Handlers for Raise Hand & Reactions
-  router.onRaiseHand = (peerId, payload) => {
+  router.onAnnouncement = (peerId, ann) => handleIncomingAnnouncement(ann);
+  signaling.onAnnouncement = (msg) => handleIncomingAnnouncement(msg.payload || msg);
+
+  // Raise Hand Handlers (Dual-Channel Delivery)
+  function handleIncomingRaiseHand(payload) {
+    if (!payload) return;
     const handBadge = document.getElementById(`rosterHand_${payload.studentId}`);
     if (handBadge) {
       handBadge.style.display = payload.isRaised ? 'inline' : 'none';
@@ -8836,10 +8954,33 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (payload.isRaised) {
       showToast(`✋ ${payload.studentName} raised their hand!`, 'info');
     }
-  };
+  }
 
-  router.onReaction = (peerId, payload) => {
+  router.onRaiseHand = (peerId, payload) => handleIncomingRaiseHand(payload);
+  signaling.onRaiseHand = (msg) => handleIncomingRaiseHand(msg.payload || msg);
+
+  // Quick Reactions / Floating Emojis (Dual-Channel Delivery)
+  const seenReactionIds = new Set();
+  function handleIncomingReaction(payload) {
+    if (!payload || !payload.emoji) return;
+    if (payload.id && seenReactionIds.has(payload.id)) return;
+    if (payload.id) {
+      seenReactionIds.add(payload.id);
+      setTimeout(() => seenReactionIds.delete(payload.id), 2500);
+    }
     spawnFloatingEmoji(payload.emoji);
+  }
+
+  router.onReaction = (peerId, payload) => handleIncomingReaction(payload);
+  signaling.onReaction = (msg) => handleIncomingReaction(msg.payload || msg);
+
+  // Stream Status Broadcast Handler
+  signaling.onStreamStarted = () => {
+    if (classroom.role !== 'teacher') {
+      showToast('Presenter started screen sharing!', 'info');
+      setStreamEngine('webrtc');
+      if (studentRemoteVideo) studentRemoteVideo.play().catch(() => {});
+    }
   };
 
   chatExportBtn.addEventListener('click', async () => {
