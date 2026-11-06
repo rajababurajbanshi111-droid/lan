@@ -2736,10 +2736,6 @@ body {
 
         <!-- Unified Session Code Join Form -->
         <div id="studentAutoJoinForm" style="display: flex; flex-direction: column; gap: 1.25rem;">
-          <div id="studentHttpsWarning" style="display: none; background: rgba(255, 170, 0, 0.12); border: 1px solid var(--accent-amber); border-radius: var(--radius-sm); padding: 0.75rem; font-size: 0.76rem; color: #ffcc66; line-height: 1.4;">
-            ⚠️ <strong>HTTPS Warning:</strong> Browsers block HTTPS (GitHub Pages) from connecting to local offline LAN servers. For zero-internet streaming, open <code>http://&lt;teacher-ip&gt;:3000</code> directly on your Wi-Fi.
-          </div>
-
           <div>
             <label style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.4rem; display: block; font-weight: 600;">
               6-Digit Session Code
@@ -2752,20 +2748,6 @@ body {
               Your Display Name
             </label>
             <input type="text" class="input-field" id="studentDisplayNameInput" value="Student" maxlength="40">
-          </div>
-
-          <div id="studentServerHostBox" style="display: none;">
-            <label style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.4rem; display: block; font-weight: 600;">
-              Teacher Server IP:Port
-            </label>
-            <input type="text" class="input-field" id="studentServerHostInput" placeholder="e.g. 11.12.2.126:3000" style="font-family: var(--font-mono); font-size: 0.9rem;">
-            <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 0.25rem;">Enter the teacher's IP shown on their screen or terminal.</div>
-          </div>
-
-          <div style="display: flex; justify-content: flex-end;">
-            <button type="button" id="studentToggleHostConfig" style="background: none; border: none; font-size: 0.74rem; color: var(--accent-cyan); cursor: pointer; text-decoration: underline; padding: 0;">
-              Configure Teacher IP
-            </button>
           </div>
 
           <button class="btn btn-success" id="studentSubmitJoinBtn" style="width: 100%; padding: 0.9rem; font-size: 1rem; font-weight: 600;">
@@ -3085,10 +3067,12 @@ body {
   'use strict';
 
   return {
-    // LAN-Only Mode: Zero external STUN or TURN servers queried.
-    // RTCPeerConnection gathers only local host candidates (e.g. 192.168.x.x, 10.x.x.x)
-    // guaranteeing complete privacy, 0 KB external data egress, and reliable offline operation.
-    DEFAULT_ICE_SERVERS: [],
+    // Default STUN servers for direct NAT punch-through and mDNS bypass (Zero data relay, pure P2P)
+    DEFAULT_ICE_SERVERS: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' }
+    ],
 
     // Cloud Signaling Broker for GitHub Pages
     // Free hosted WSS endpoint that matches 6-digit session codes over HTTPS
@@ -4327,11 +4311,11 @@ class WebRTCManager {
       };
     }
 
-    // ICE Candidate handler (LAN-Only: Only host candidates across local network)
+    // ICE Candidate handler
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        // Enforce LAN isolation: drop any non-host candidate
-        if (event.candidate.type && event.candidate.type !== 'host') {
+        // Discard external TURN relay candidates; allow direct host and srflx
+        if (event.candidate.type === 'relay') {
           return;
         }
         if (this.onIceCandidate) {
@@ -4528,9 +4512,8 @@ class WebRTCManager {
    */
   async addIceCandidate(peerId, candidate) {
     if (!candidate) return;
-    // LAN-Only: filter out any non-host candidate
-    if (candidate.type && candidate.type !== 'host') return;
-    if (typeof candidate.candidate === 'string' && (candidate.candidate.includes('typ srflx') || candidate.candidate.includes('typ relay'))) {
+    if (candidate.type === 'relay') return;
+    if (typeof candidate.candidate === 'string' && candidate.candidate.includes('typ relay')) {
       return;
     }
     const pc = this.peerConnections.get(peerId);
@@ -5000,9 +4983,9 @@ class SignalingManager {
     const paramServer = urlParams.get('server') || urlParams.get('signal');
     const storedServer = localStorage.getItem('teacherServerHost');
     
-    // Automatically use Serverless Public Broker on GitHub Pages / HTTPS with ZERO server needed!
-    const isHttpsOrGitHub = loc.protocol === 'https:' || loc.hostname.includes('github') || loc.hostname.includes('vercel');
-    this.isMqttMode = !serverUrlOverride && !paramServer && isHttpsOrGitHub;
+    // Automatically use Serverless Public Broker (HiveMQ/EMQX) with ZERO server needed!
+    const isCustomLocalServer = (loc.hostname === 'localhost' || loc.hostname === '127.0.0.1') && (loc.port === '3000' || loc.port === '8080');
+    this.isMqttMode = !serverUrlOverride && !paramServer && !isCustomLocalServer;
 
     if (serverUrlOverride) {
       this.serverUrl = this.sanitizeUrl(serverUrlOverride);
@@ -5015,13 +4998,11 @@ class SignalingManager {
       this.serverUrl = 'wss://broker.hivemq.com:8884/mqtt';
     } else if (storedServer) {
       this.serverUrl = this.sanitizeUrl(storedServer);
-    } else if (loc.protocol === 'file:') {
-      this.serverUrl = 'ws://localhost:3000/ws';
     } else {
-      // Direct LAN connection: dynamically binds to the host and port serving the page
+      // Custom local development server
       const wsProtocol = loc.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsPort = loc.port ? `:${loc.port}` : '';
-      this.serverUrl = `${wsProtocol}//${loc.hostname}${wsPort}/ws`;
+      const wsPort = loc.port ? `:${loc.port}` : ':3000';
+      this.serverUrl = `${wsProtocol}//${loc.hostname || 'localhost'}${wsPort}/ws`;
     }
 
     console.log(`[Signaling] Connecting (Mode: ${this.isMqttMode ? 'Serverless Public Broker' : 'Local WS'}):`, this.serverUrl);
@@ -5133,13 +5114,19 @@ class SignalingManager {
 
   scheduleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log('[Signaling] Max WebSocket reconnect attempts reached. Remaining in Zero-Server mode.');
-      return;
+      console.log('[Signaling] Max WebSocket reconnect attempts reached. Resetting counter for continuous availability.');
+      this.reconnectAttempts = 0;
     }
     this.reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000);
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 8000);
     console.log(`[Signaling] Scheduling reconnect attempt #${this.reconnectAttempts} in ${delay}ms`);
     this.reconnectTimer = setTimeout(() => {
+      if (this.isMqttMode && this.reconnectAttempts > 2) {
+        // Redundancy: Alternate to secondary broker if primary fails
+        this.serverUrl = (this.serverUrl.includes('hivemq')) 
+          ? 'wss://broker.emqx.io:8084/mqtt' 
+          : 'wss://broker.hivemq.com:8884/mqtt';
+      }
       this.connectWebSocket(this.serverUrl);
     }, delay);
   }
@@ -5193,15 +5180,14 @@ class SignalingManager {
         this.ws.send(subStudent);
         this.ws.send(subBcast);
         topic = `smartclassroom_v1/${room}/teacher`;
-      } else if (messageObj.recipientId) {
-        if (messageObj.recipientId === 'teacher' || (typeof messageObj.recipientId === 'string' && messageObj.recipientId.startsWith('teach_'))) {
-          topic = `smartclassroom_v1/${room}/teacher`;
-        } else {
-          topic = `smartclassroom_v1/${room}/student_${messageObj.recipientId}`;
-        }
       } else if (this.role === 'student') {
+        // Any message sent by student (signal_answer, signal_candidate, leave) routes directly to teacher!
         topic = `smartclassroom_v1/${room}/teacher`;
+      } else if (messageObj.recipientId) {
+        // Teacher sending directly to an individual student (signal_offer, signal_candidate, approve, kick)
+        topic = `smartclassroom_v1/${room}/student_${messageObj.recipientId}`;
       } else {
+        // Broadcast to all students in room
         topic = `smartclassroom_v1/${room}/broadcast`;
       }
 
@@ -8273,40 +8259,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     screenShare.switchPreset(teacherQualitySelect.value);
   });
 
-  const studentServerHostBox = document.getElementById('studentServerHostBox');
-  const studentServerHostInput = document.getElementById('studentServerHostInput');
-  const studentToggleHostConfig = document.getElementById('studentToggleHostConfig');
-  const studentHttpsWarning = document.getElementById('studentHttpsWarning');
-
-  // Check if opening from HTTPS (like GitHub Pages) or file://
-  if (window.location.protocol === 'https:' && studentHttpsWarning) {
-    studentHttpsWarning.style.display = 'block';
-  }
-  if ((window.location.protocol === 'file:' || window.location.hostname.includes('github')) && studentServerHostBox) {
-    studentServerHostBox.style.display = 'block';
-    const saved = localStorage.getItem('teacherServerHost');
-    if (saved && studentServerHostInput) studentServerHostInput.value = saved;
-  }
-  if (studentToggleHostConfig && studentServerHostBox) {
-    studentToggleHostConfig.addEventListener('click', () => {
-      const isVisible = studentServerHostBox.style.display === 'block';
-      studentServerHostBox.style.display = isVisible ? 'none' : 'block';
-    });
-  }
-
   // --- 10. Unified Student Join Workflow (Session Code Only) ---
   studentSubmitJoinBtn.addEventListener('click', () => {
     const code = studentRoomCodeInput.value.trim();
     const name = studentDisplayNameInput.value.trim() || 'Student';
-    const hostInput = studentServerHostInput ? studentServerHostInput.value.trim() : '';
 
     if (!code || code.length !== 6) {
       return showToast('Please enter a valid 6-digit session code.', 'warning');
-    }
-
-    if (hostInput) {
-      localStorage.setItem('teacherServerHost', hostInput);
-      signaling.connectWebSocket(hostInput);
     }
 
     storage.saveUserProfile({ displayName: name, role: 'student' });
