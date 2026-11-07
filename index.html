@@ -2863,7 +2863,12 @@ body {
         <div id="studentWaitingApprovalBox" style="display: none; background: linear-gradient(135deg, rgba(164,18,100,0.18), rgba(122,10,74,0.12)); border: 1.5px solid #A41264; border-radius: var(--radius-md); padding: 1.5rem; text-align: center; box-shadow: 0 8px 24px rgba(164,18,100,0.3);">
           <div style="width: 44px; height: 44px; border: 3px solid rgba(255,255,255,0.15); border-top-color: #FFA6D8; border-radius: 50%; margin: 0 auto 1rem auto; animation: amritaSpin 1s linear infinite;"></div>
           <h4 style="font-size: 1.05rem; color: #FFA6D8; font-weight: 700; margin-bottom: 0.35rem;">Admission Request Submitted</h4>
-          <p style="font-size: 0.82rem; color: #E2CFDB; line-height: 1.45; margin-bottom: 0.65rem;">Your request has been sent to the professor. You will be admitted automatically as soon as your admission is approved.</p>
+          <p style="font-size: 0.82rem; color: #E2CFDB; line-height: 1.45; margin-bottom: 0.85rem;">Your request has been sent to the professor. You will be admitted automatically as soon as your admission is approved.</p>
+          <div style="margin-bottom: 0.85rem;">
+            <button class="btn btn-success" id="studentEnterStageBtn" style="font-size: 0.84rem; padding: 0.5rem 1.1rem; background: linear-gradient(135deg, #A41264, #C4187B); border: 1px solid #FFA6D8; font-weight: 700; cursor: pointer;">
+              🚀 Enter Stage Directly (If Professor Approved)
+            </button>
+          </div>
           <div style="font-size: 0.74rem; color: #A38799;">Amrita Vishwa Vidyapeetham · Secure Live Stream</div>
         </div>
         <style>@keyframes amritaSpin { to { transform: rotate(360deg); } }</style>
@@ -4990,25 +4995,8 @@ class SignalingManager {
           { urls: 'stun:stun2.l.google.com:19302' },
           { urls: 'stun:stun3.l.google.com:19302' },
           { urls: 'stun:stun4.l.google.com:19302' },
-          { urls: 'stun:stun.services.mozilla.com' },
-          { urls: 'stun:global.stun.twilio.com:3478' },
-          {
-            urls: [
-              'turn:eu-0.turn.peerjs.com:3478',
-              'turn:us-0.turn.peerjs.com:3478'
-            ],
-            username: 'peerjs',
-            credential: 'peerjsp'
-          },
-          {
-            urls: [
-              'turn:openrelay.metered.ca:80',
-              'turn:openrelay.metered.ca:443',
-              'turns:openrelay.metered.ca:443?transport=tcp'
-            ],
-            username: 'openrelay',
-            credential: 'openrelay'
-          }
+          { urls: 'stun:stun.cloudflare.com:3478' },
+          { urls: 'stun:global.stun.twilio.com:3478' }
         ],
         sdpSemantics: 'unified-plan'
       }
@@ -5178,7 +5166,7 @@ class SignalingManager {
         console.log('[Signaling] Connecting student to teacher:', teacherPeerId);
 
         const conn = this.peer.connect(teacherPeerId, {
-          reliable: true,
+          serialization: 'json',
           metadata: { studentName: this.studentName }
         });
 
@@ -5245,12 +5233,35 @@ class SignalingManager {
           console.log('[Signaling] Presentation stream received! Tracks:', remoteStream.getTracks().length);
           this.pendingRemoteStream = remoteStream;
 
-          if (window.classroom && window.classroom.isApproved) {
-            if (typeof activateRemoteVideoStream === 'function') {
-              activateRemoteVideoStream(remoteStream);
-            }
-          } else {
-            console.log('[Signaling] Stream buffered; waiting for professor admission approval.');
+          // Professor dispatching presentation stream confirms admission approval!
+          if (window.classroom) {
+            window.classroom.isApproved = true;
+            window.classroom.isSessionActive = true;
+          }
+
+          // Force transition UI to live stage immediately
+          const waitBox = document.getElementById('studentWaitingApprovalBox');
+          const autoForm = document.getElementById('studentAutoJoinForm');
+          const joinScr = document.getElementById('studentJoinScreen');
+          const classScr = document.getElementById('studentClassroomScreen');
+          if (waitBox) waitBox.style.setProperty('display', 'none', 'important');
+          if (autoForm) autoForm.style.setProperty('display', 'none', 'important');
+          if (joinScr) joinScr.style.setProperty('display', 'none', 'important');
+          if (classScr) classScr.style.setProperty('display', 'flex', 'important');
+
+          if (typeof switchView === 'function') switchView('student');
+          if (typeof activateRemoteVideoStream === 'function') {
+            activateRemoteVideoStream(remoteStream);
+          }
+
+          if (this.teacherConn && this.teacherConn.open) {
+            try {
+              this.teacherConn.send({
+                type: 'room_join_ack',
+                studentId: this.clientId,
+                roomCode: this.currentRoomCode
+              });
+            } catch(e) {}
           }
         });
 
@@ -5281,18 +5292,34 @@ class SignalingManager {
   // Teacher sends admission approval to student over data connection
   sendApprovalToStudent(studentId) {
     const conn = this.studentConnections.get(studentId);
-    if (conn && conn.open) {
+    if (!conn) return;
+
+    const payload = {
+      type: 'room_join_approved',
+      roomCode: this.currentRoomCode,
+      teacherId: this.clientId,
+      recipientId: studentId,
+      timestamp: Date.now()
+    };
+
+    if (conn.open) {
       try {
-        conn.send({
-          type: 'room_join_approved',
-          roomCode: this.currentRoomCode,
-          teacherId: this.clientId,
-          recipientId: studentId,
-          timestamp: Date.now()
-        });
+        conn.send(payload);
         console.log('[Signaling] Sent room_join_approved to student:', studentId);
       } catch (e) {
         console.warn('[Signaling] Error sending room_join_approved:', e);
+      }
+    } else {
+      const onOpenDeliver = () => {
+        try {
+          conn.send(payload);
+          console.log('[Signaling] Sent room_join_approved on data channel open to student:', studentId);
+        } catch(e) {}
+      };
+      if (typeof conn.once === 'function') {
+        conn.once('open', onOpenDeliver);
+      } else {
+        conn.on('open', onOpenDeliver);
       }
     }
   }
@@ -5486,6 +5513,15 @@ class SignalingManager {
 
     switch (msg.type) {
       case 'room_join_request':
+        const studentId = fromPeer || msg.senderId;
+        if (this.approvedStudents.has(studentId) || (window.classroom && window.classroom.connectedStudents && window.classroom.connectedStudents.has(studentId))) {
+          console.log('[Signaling] Student pinged but is ALREADY approved! Re-sending approval:', studentId);
+          this.sendApprovalToStudent(studentId);
+          if (this.activeStream && this.peer) {
+            this.dispatchCallToStudent(studentId);
+          }
+          return;
+        }
         if (this.onJoinRequest) this.onJoinRequest(msg);
         break;
 
@@ -5606,6 +5642,10 @@ class SignalingManager {
   }
 }
 
+// Global exposure of SignalingManager
+window.SignalingManager = SignalingManager;
+window.signalingManager = new SignalingManager();
+
 class ScreenShareManager {
   constructor(webrtcManager, signalingManager = null) {
     this.webrtcManager = webrtcManager;
@@ -5678,13 +5718,17 @@ class ScreenShareManager {
       this.isSharing = true;
       this.isPaused = false;
 
-      // Register stream with WebRTC manager to broadcast
-      if (this.webrtcManager) {
-        this.webrtcManager.addLocalStream('screen', this.activeStream);
+      // Broadcast screen presentation via PeerJS Signaling Manager
       if (this.signalingManager && typeof this.signalingManager.broadcastStream === 'function') {
         this.signalingManager.broadcastStream(this.activeStream);
       }
-        await this.webrtcManager.setMaxBitrate(preset.maxBitrate);
+
+      // Register stream with WebRTC manager
+      if (this.webrtcManager) {
+        try {
+          this.webrtcManager.addLocalStream('screen', this.activeStream);
+          await this.webrtcManager.setMaxBitrate(preset.maxBitrate);
+        } catch(e) {}
       }
 
       // Also launch SFU binary media streamer so students on any network receive live presentation
@@ -7856,7 +7900,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   // --- 1. Subsystems Initialization ---
   const storage = window.storageManager;
   const webrtc = new WebRTCManager();
-  const signaling = window.signalingManager;
+  const signaling = window.signalingManager || new SignalingManager();
+  window.signalingManager = signaling;
+  window.signaling = signaling;
   const router = new DataChannelRouter(webrtc, signaling);
   const screenShare = new ScreenShareManager(webrtc, signaling);
   const fileTransfer = new FileTransferManager(webrtc, router, signaling);
@@ -8511,10 +8557,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   const studentEnterStageBtn = document.getElementById('studentEnterStageBtn');
   if (studentEnterStageBtn) {
     studentEnterStageBtn.addEventListener('click', () => {
+      classroom.isApproved = true;
       classroom.isSessionActive = true;
+      if (studentWaitingApprovalBox) studentWaitingApprovalBox.style.setProperty('display', 'none', 'important');
+      if (studentAutoJoinForm) studentAutoJoinForm.style.setProperty('display', 'none', 'important');
+      if (studentJoinScreen) studentJoinScreen.style.setProperty('display', 'none', 'important');
+      if (studentClassroomScreen) studentClassroomScreen.style.setProperty('display', 'flex', 'important');
       switchView('student');
       startSessionTimer();
-      showToast('Entered classroom stage. Waiting for teacher to broadcast...', 'info');
+      if (signaling.pendingRemoteStream) {
+        activateRemoteVideoStream(signaling.pendingRemoteStream);
+      }
+      showToast('Entered Amrita classroom stage!', 'success');
     });
   }
 
@@ -8766,6 +8820,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
   // Helper: Activates remote screen presentation stream with robust play & empty state hiding
+  window.activateRemoteVideoStream = activateRemoteVideoStream;
+  window.deactivateRemoteVideoStream = deactivateRemoteVideoStream;
+
   function activateRemoteVideoStream(stream) {
     const studentVideo = document.getElementById('studentRemoteVideo');
     const emptyState = document.getElementById('studentStreamEmptyState');
@@ -8785,6 +8842,12 @@ document.addEventListener('DOMContentLoaded', async () => {
           console.log('[Video] Live presentation playback started successfully.');
         }).catch((err) => {
           console.warn('[Video] Autoplay blocked, click required:', err);
+          showToast('Click anywhere on stage to enable live audio & video playback!', 'info');
+          const enablePlay = () => {
+            studentVideo.play().catch(() => {});
+            document.removeEventListener('click', enablePlay);
+          };
+          document.addEventListener('click', enablePlay, { once: true });
         });
       }
     }
