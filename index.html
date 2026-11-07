@@ -2567,6 +2567,47 @@ body {
             </div>
           </div>
 
+          <!-- Attendance Tracking & CSV Export Section -->
+          <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1.25rem; margin-top: 1.5rem;">
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem;">
+              <div>
+                <h4 style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem;">
+                  <span>📋 Live Classroom Attendance &amp; Verified Roster</span>
+                  <span class="sidebar-badge" id="attendancePresentCountBadge" style="background: rgba(16,185,129,0.2); color: var(--accent-green); border: 1px solid var(--accent-green);">0 Present</span>
+                </h4>
+                <p style="font-size: 0.8rem; color: var(--text-secondary); margin: 0;">
+                  Tracks authenticated LAN participants with Roll Numbers, Names, and connection timestamps.
+                </p>
+              </div>
+              <div style="display: flex; gap: 0.75rem; align-items: center;">
+                <input type="text" class="input-field" id="attendanceRangeFilter" placeholder="Filter Roll No (e.g. CSE21)" style="max-width: 170px; padding: 0.35rem 0.65rem; font-size: 0.78rem;">
+                <button class="btn btn-primary" id="btnExportAttendanceCsv" style="padding: 0.4rem 0.85rem; font-size: 0.8rem; display: flex; align-items: center; gap: 0.4rem;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                  <span>Export Attendance (CSV)</span>
+                </button>
+              </div>
+            </div>
+
+            <div style="overflow-x: auto; max-height: 280px; overflow-y: auto; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+              <table style="width: 100%; border-collapse: collapse; font-size: 0.82rem; text-align: left;">
+                <thead>
+                  <tr style="background: rgba(255,255,255,0.04); border-bottom: 1px solid var(--border-subtle); color: #FFA6D8;">
+                    <th style="padding: 0.6rem 0.85rem;">Roll Number</th>
+                    <th style="padding: 0.6rem 0.85rem;">Student Name</th>
+                    <th style="padding: 0.6rem 0.85rem;">Joined Time</th>
+                    <th style="padding: 0.6rem 0.85rem;">Status</th>
+                    <th style="padding: 0.6rem 0.85rem;">Transport</th>
+                  </tr>
+                </thead>
+                <tbody id="attendanceTableBody">
+                  <tr>
+                    <td colspan="5" style="padding: 1.25rem; text-align: center; color: var(--text-muted);">No attendance records recorded for this session yet.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <!-- Classroom Permission Controls -->
           <div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-md); padding: 1.25rem; margin-top: 1.5rem;">
             <h4 style="margin-bottom: 0.85rem;">Student Privileges &amp; Permission Controls</h4>
@@ -2847,11 +2888,17 @@ body {
             <input type="text" class="input-field" id="studentRoomCodeInput" placeholder="e.g. 482913" maxlength="6" style="font-family: var(--font-mono); font-size: 1.6rem; letter-spacing: 0.2em; text-align: center; font-weight: 700; color: var(--accent-cyan);">
           </div>
 
-          <div>
-            <label style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.4rem; display: block; font-weight: 600;">
-              Your Display Name
+          <div style="margin-bottom: 0.85rem;">
+            <label style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.35rem; display: block; font-weight: 600;">
+              Student Full Name
             </label>
-            <input type="text" class="input-field" id="studentDisplayNameInput" value="Student" maxlength="40">
+            <input type="text" class="input-field" id="studentDisplayNameInput" placeholder="e.g. Rahul Sharma" value="Student" maxlength="40">
+          </div>
+          <div style="margin-bottom: 1.1rem;">
+            <label style="font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 0.35rem; display: block; font-weight: 600;">
+              Roll Number / Student ID
+            </label>
+            <input type="text" class="input-field" id="studentRollNumberInput" placeholder="e.g. BL.EN.U4CSE21001" maxlength="35">
           </div>
 
           <button class="btn btn-success" id="studentSubmitJoinBtn" style="width: 100%; padding: 0.9rem; font-size: 1rem; font-weight: 600;">
@@ -5079,6 +5126,9 @@ class SignalingManager {
         conn.on('open', () => {
           console.log('[Signaling] Data channel opened with student:', conn.peer);
           this.studentConnections.set(conn.peer, conn);
+          if (conn.peerConnection && window.webrtc) {
+            window.webrtc.peerConnections.set(conn.peer, conn.peerConnection);
+          }
 
           // If student was already approved by teacher, send approval now over the open channel!
           if (this.approvedStudents.has(conn.peer)) {
@@ -5167,7 +5217,7 @@ class SignalingManager {
 
         const conn = this.peer.connect(teacherPeerId, {
           serialization: 'json',
-          metadata: { studentName: this.studentName }
+          metadata: { studentName: this.studentName, rollNo: this.studentRollNo || 'N/A' }
         });
 
         this.teacherConn = conn;
@@ -5179,6 +5229,7 @@ class SignalingManager {
                 type: 'room_join_request',
                 senderId: myId,
                 studentName: this.studentName,
+                rollNo: this.studentRollNo || 'N/A',
                 roomCode: this.currentRoomCode,
                 clientInfo: {
                   userAgent: navigator.userAgent,
@@ -5192,6 +5243,9 @@ class SignalingManager {
 
         conn.on('open', () => {
           console.log('[Signaling] Data channel connected to professor! Sending join request...');
+          if (conn.peerConnection && window.webrtc) {
+            window.webrtc.peerConnections.set(teacherPeerId, conn.peerConnection);
+          }
           sendJoinPing();
         });
 
@@ -7550,6 +7604,7 @@ class ClassroomManager {
       const student = {
         id: msg.senderId,
         name: SecurityManager.escapeHTML(msg.studentName || 'Student'),
+        rollNo: SecurityManager.escapeHTML(msg.rollNo || (msg.clientInfo && msg.clientInfo.rollNo) || 'N/A'),
         timestamp: Date.now(),
         clientInfo: msg.clientInfo || {}
       };
@@ -7616,12 +7671,13 @@ class ClassroomManager {
   /**
    * Student requests to join a classroom
    */
-  requestJoin(roomCode, studentName) {
+  requestJoin(roomCode, studentName, rollNo = 'N/A') {
     this.role = 'student';
     this.sessionCode = roomCode.trim();
+    this.studentRollNo = rollNo;
 
     if (this.signalingManager) {
-      this.signalingManager.requestJoinClassroom(this.sessionCode, studentName);
+      this.signalingManager.requestJoinClassroom(this.sessionCode, studentName, rollNo);
     }
   }
 
@@ -8532,14 +8588,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     let rawCode = studentRoomCodeInput.value || '';
     const code = rawCode.trim().replace(/[^0-9]/g, '');
     const name = studentDisplayNameInput.value.trim() || 'Student';
+    const rollNoInput = document.getElementById('studentRollNumberInput');
+    const rollNo = (rollNoInput ? rollNoInput.value.trim() : '') || 'N/A';
 
     if (!code || code.length !== 6) {
       return showToast('Please enter a valid 6-digit session code (e.g. 482913).', 'warning');
     }
 
     studentRoomCodeInput.value = code;
-    storage.saveUserProfile({ displayName: name, role: 'student' });
-    classroom.requestJoin(code, name);
+    storage.saveUserProfile({ displayName: name, rollNo: rollNo, role: 'student' });
+    classroom.requestJoin(code, name, rollNo);
 
     studentAutoJoinForm.style.display = 'none';
     studentWaitingApprovalBox.style.display = 'block';
@@ -8823,16 +8881,33 @@ document.addEventListener('DOMContentLoaded', async () => {
   window.activateRemoteVideoStream = activateRemoteVideoStream;
   window.deactivateRemoteVideoStream = deactivateRemoteVideoStream;
 
+  let hasShownAutoplayNotice = false;
   function activateRemoteVideoStream(stream) {
     const studentVideo = document.getElementById('studentRemoteVideo');
     const emptyState = document.getElementById('studentStreamEmptyState');
 
+    // GUARD: If stream is null or has no video tracks, DO NOT hide the empty state and DO NOT show black box!
+    if (!stream || typeof stream.getVideoTracks !== 'function' || stream.getVideoTracks().length === 0) {
+      console.log('[Video] Stream has no active video tracks. Retaining stage empty state.');
+      if (emptyState) emptyState.style.setProperty('display', 'flex', 'important');
+      if (studentVideo) {
+        studentVideo.style.setProperty('display', 'none', 'important');
+        studentVideo.srcObject = null;
+      }
+      return;
+    }
+
     if (emptyState) {
       emptyState.style.setProperty('display', 'none', 'important');
     }
+
     if (studentVideo) {
       studentVideo.style.setProperty('display', 'block', 'important');
-      studentVideo.srcObject = stream;
+
+      // CRITICAL: Only assign srcObject if DIFFERENT to avoid AbortError interruption loop!
+      if (studentVideo.srcObject !== stream) {
+        studentVideo.srcObject = stream;
+      }
       studentVideo.muted = true;
       studentVideo.playsInline = true;
 
@@ -8841,13 +8916,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         p.then(() => {
           console.log('[Video] Live presentation playback started successfully.');
         }).catch((err) => {
-          console.warn('[Video] Autoplay blocked, click required:', err);
-          showToast('Click anywhere on stage to enable live audio & video playback!', 'info');
-          const enablePlay = () => {
-            studentVideo.play().catch(() => {});
-            document.removeEventListener('click', enablePlay);
-          };
-          document.addEventListener('click', enablePlay, { once: true });
+          console.warn('[Video] Playback pending or blocked:', err);
+          if (!hasShownAutoplayNotice && err && err.name === 'NotAllowedError') {
+            hasShownAutoplayNotice = true;
+            showToast('Click anywhere on the presentation stage to enable live audio & video!', 'info');
+            const enablePlay = () => {
+              studentVideo.play().catch(() => {});
+              document.removeEventListener('click', enablePlay);
+            };
+            document.addEventListener('click', enablePlay, { once: true });
+          }
         });
       }
     }
@@ -8861,11 +8939,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     const studentVideo = document.getElementById('studentRemoteVideo');
     const emptyState = document.getElementById('studentStreamEmptyState');
     if (studentVideo) {
-      if (studentVideo.srcObject) {
-        try {
-          studentVideo.srcObject.getTracks().forEach((t) => t.stop());
-        } catch(e) {}
-      }
       studentVideo.srcObject = null;
       studentVideo.style.setProperty('display', 'none', 'important');
     }
@@ -8964,6 +9037,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // When Teacher approves student -> Teacher initiates offer to student
   classroom.onStudentApproved = (student) => {
     showToast(`Admitted student "${student.name}".`, 'success');
+    updateAttendanceRecord(student, 'Present');
     renderPendingApprovals();
     renderConnectedRoster();
   };
@@ -8995,7 +9069,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         <span style="font-size: 1.5rem;">🎓</span>
         <div>
           <div style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: #FFA6D8; font-weight: 700;">Amrita Admission Request</div>
-          <div style="font-size: 0.95rem; font-weight: 700; color: #FFFFFF;">${SecurityManager.escapeHTML(student.name)}</div>
+          <div style="font-size: 0.95rem; font-weight: 700; color: #FFFFFF;">${SecurityManager.escapeHTML(student.name)} <span style="font-size: 0.78rem; color: #FFA6D8; font-family: var(--font-mono); font-weight: normal;">(${SecurityManager.escapeHTML(student.rollNo || 'N/A')})</span></div>
         </div>
       </div>
       <div style="display: flex; gap: 0.5rem; align-items: center;">
@@ -9020,7 +9094,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   }
 
-  classroom.onStudentLeft = () => {
+  classroom.onStudentLeft = (studentId) => {
+    if (studentId) {
+      sessionAttendance.forEach((rec, key) => {
+        if (rec.id === studentId) rec.status = 'Disconnected';
+      });
+      renderAttendanceTable();
+    }
     renderConnectedRoster();
     renderPendingApprovals();
   };
@@ -9122,7 +9202,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       item.style.cssText = 'background: rgba(255,255,255,0.03); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 0.65rem 0.85rem; display: flex; align-items: center; justify-content: space-between;';
       item.innerHTML = `
         <div>
-          <div style="font-weight: 600; font-size: 0.85rem;">${st.name}</div>
+          <div style="font-weight: 600; font-size: 0.85rem;">${st.name} <span style="font-size: 0.72rem; color: #FFA6D8; font-family: var(--font-mono); margin-left: 0.35rem;">[${st.rollNo || 'N/A'}]</span></div>
           <div style="font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono);">${st.clientInfo.screenRes || 'Desktop Client'}</div>
         </div>
         <div style="display: flex; gap: 0.4rem;">
@@ -9164,7 +9244,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       item.innerHTML = `
         <div>
           <div style="font-weight: 600; font-size: 0.85rem; display: flex; align-items: center; gap: 0.4rem;">
-            <span>${st.name}</span>
+            <span>${st.name}</span> <span style="font-size: 0.72rem; color: #FFA6D8; font-family: var(--font-mono);">[${st.rollNo || 'N/A'}]</span>
             <span id="rosterHand_${st.id}" style="display: none; font-size: 0.8rem;">✋</span>
           </div>
           <div style="font-size: 0.7rem; color: var(--accent-green); font-family: var(--font-mono);">Connected (P2P / SFU)</div>
