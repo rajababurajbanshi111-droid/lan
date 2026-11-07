@@ -3240,11 +3240,33 @@ if (typeof Peer === 'undefined') {
   'use strict';
 
   return {
-    // Default STUN servers for direct NAT punch-through and mDNS bypass (Zero data relay, pure P2P)
+    // Default STUN & TURN servers for direct NAT punch-through and universal LAN/WAN relay
     DEFAULT_ICE_SERVERS: [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
-      { urls: 'stun:stun2.l.google.com:19302' }
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+      {
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turn:openrelay.metered.ca:443?transport=tcp',
+          'turn:standard.relay.metered.ca:80',
+          'turn:standard.relay.metered.ca:443',
+          'turn:standard.relay.metered.ca:443?transport=tcp'
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: [
+          'turn:eu-0.turn.peerjs.com:3478',
+          'turn:us-0.turn.peerjs.com:3478'
+        ],
+        username: 'peerjs',
+        credential: 'peerjsp'
+      }
     ],
 
     // Cloud Signaling Broker for GitHub Pages
@@ -4479,13 +4501,9 @@ class WebRTCManager {
       };
     }
 
-    // ICE Candidate handler
+    // ICE Candidate handler (Direct LAN host, srflx, and TURN relay)
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        // Discard external TURN relay candidates; allow direct host and srflx
-        if (event.candidate.type === 'relay') {
-          return;
-        }
         if (this.onIceCandidate) {
           this.onIceCandidate(peerId, event.candidate);
         }
@@ -5043,9 +5061,30 @@ class SignalingManager {
           { urls: 'stun:stun3.l.google.com:19302' },
           { urls: 'stun:stun4.l.google.com:19302' },
           { urls: 'stun:stun.cloudflare.com:3478' },
-          { urls: 'stun:global.stun.twilio.com:3478' }
+          { urls: 'stun:global.stun.twilio.com:3478' },
+          {
+            urls: [
+              'turn:openrelay.metered.ca:80',
+              'turn:openrelay.metered.ca:443',
+              'turn:openrelay.metered.ca:443?transport=tcp',
+              'turn:standard.relay.metered.ca:80',
+              'turn:standard.relay.metered.ca:443',
+              'turn:standard.relay.metered.ca:443?transport=tcp'
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+          },
+          {
+            urls: [
+              'turn:eu-0.turn.peerjs.com:3478',
+              'turn:us-0.turn.peerjs.com:3478'
+            ],
+            username: 'peerjs',
+            credential: 'peerjsp'
+          }
         ],
-        sdpSemantics: 'unified-plan'
+        sdpSemantics: 'unified-plan',
+        iceCandidatePoolSize: 4
       }
     };
   }
@@ -5260,6 +5299,15 @@ class SignalingManager {
         }, 1500);
 
         conn.on('data', (data) => {
+          // Binary Frame Relay (SFU / DataChannel Frame Streamer)
+          if (data instanceof ArrayBuffer || data instanceof Blob || (data && data.byteLength !== undefined) || (data && data.buffer instanceof ArrayBuffer)) {
+            if (typeof this.onBinaryMedia === 'function') {
+              const buf = data instanceof Blob ? data : (data instanceof ArrayBuffer ? data : (data.buffer || data));
+              this.onBinaryMedia(buf);
+            }
+            return;
+          }
+
           try {
             const msg = typeof data === 'string' ? JSON.parse(data) : data;
             this.handleIncomingMessage(msg);
@@ -5283,9 +5331,35 @@ class SignalingManager {
         console.log('[Signaling] Incoming presentation call from teacher:', call.peer);
         call.answer();
 
+        // Register underlying RTCPeerConnection for live stats & diagnostics
+        if (call.peerConnection) {
+          if (window.webrtc) {
+            window.webrtc.peerConnections.set('media-' + call.peer, call.peerConnection);
+          }
+          // Native ontrack hook ensures stream activates immediately even if PeerJS misses it
+          call.peerConnection.ontrack = (event) => {
+            console.log('[Signaling] Native RTCPeerConnection.ontrack fired! Kind:', event.track.kind);
+            const rStream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+            this.pendingRemoteStream = rStream;
+            if (typeof activateRemoteVideoStream === 'function') {
+              activateRemoteVideoStream(rStream);
+            }
+          };
+        }
+
         call.on('stream', (remoteStream) => {
           console.log('[Signaling] Presentation stream received! Tracks:', remoteStream.getTracks().length);
           this.pendingRemoteStream = remoteStream;
+
+          // Listen for any later arriving tracks (e.g. video arriving after audio)
+          if (typeof remoteStream.addEventListener === 'function') {
+            remoteStream.onaddtrack = () => {
+              console.log('[Signaling] Additional track added to remote stream:', remoteStream.getTracks().map(t => t.kind));
+              if (typeof activateRemoteVideoStream === 'function') {
+                activateRemoteVideoStream(remoteStream);
+              }
+            };
+          }
 
           // Professor dispatching presentation stream confirms admission approval!
           if (window.classroom) {
@@ -5648,6 +5722,14 @@ class SignalingManager {
         if (this.onReaction) this.onReaction(msg);
         break;
 
+      case 'request_stream':
+        const reqStudentId = fromPeer || msg.senderId;
+        if (this.role === 'teacher' && this.activeStream && this.peer) {
+          console.log('[Signaling] Student requested stream presentation call. Dispatching to:', reqStudentId);
+          this.dispatchCallToStudent(reqStudentId);
+        }
+        break;
+
       case 'stream_started':
         if (this.onStreamStarted) this.onStreamStarted(msg);
         break;
@@ -5677,8 +5759,36 @@ class SignalingManager {
     return true;
   }
 
-  sendBinary() { return false; }
-  getBufferedAmount() { return 0; }
+  // Broadcast binary media buffer (SFU Relay / DataChannel Frame Streamer)
+  sendBinary(buffer) {
+    if (!buffer) return false;
+    let sentCount = 0;
+    this.studentConnections.forEach((conn) => {
+      if (conn && conn.open) {
+        try {
+          conn.send(buffer);
+          sentCount++;
+        } catch (e) {}
+      }
+    });
+    if (this.ws && this.ws.readyState === 1) {
+      try {
+        this.ws.send(buffer);
+        sentCount++;
+      } catch (e) {}
+    }
+    return sentCount > 0;
+  }
+
+  getBufferedAmount() {
+    let max = 0;
+    this.studentConnections.forEach((conn) => {
+      if (conn && conn.dataChannel && typeof conn.dataChannel.bufferedAmount === 'number') {
+        if (conn.dataChannel.bufferedAmount > max) max = conn.dataChannel.bufferedAmount;
+      }
+    });
+    return max;
+  }
 
   exportSessionToken(sessionDescription) {
     const payload = {
@@ -5905,24 +6015,14 @@ class ScreenShareManager {
       let isProcessingFrame = false;
       let lastSfuSentTime = 0;
 
-      // Stream frames at ~11 FPS (every 90ms) with intelligent LAN backpressure
+      // Stream frames at ~13 FPS (every 75ms) with intelligent backpressure flow control
       this.sfuRelayInterval = setInterval(() => {
         if (!this.isSharing || !this.activeStream || this.isPaused) return;
         if (!this.relayVideoEl || this.relayVideoEl.readyState < 2) return;
         if (!this.signalingManager || !this.signalingManager.isConnected) return;
 
-        // LAN & P2P CONGESTION GUARD:
-        // If WebRTC is actively connected to peers on LAN, WebRTC is already broadcasting
-        // hardware-accelerated 30-60fps directly over LAN! Throttle SFU relay to a 3-second heartbeat
-        // so we don't saturate Wi-Fi or compete with WebRTC!
-        const hasWebRtcPeers = this.webrtcManager && typeof this.webrtcManager.hasConnectedPeers === 'function' && this.webrtcManager.hasConnectedPeers();
-        const now = Date.now();
-        if (hasWebRtcPeers && (now - lastSfuSentTime < 3000)) {
-          return;
-        }
-
-        // BACKPRESSURE CHECK: If socket buffer has > 48 KB pending, skip this frame
-        if (typeof this.signalingManager.getBufferedAmount === 'function' && this.signalingManager.getBufferedAmount() > 48 * 1024) {
+        // BACKPRESSURE CHECK: If socket/datachannel buffer has > 64 KB pending, skip this frame
+        if (typeof this.signalingManager.getBufferedAmount === 'function' && this.signalingManager.getBufferedAmount() > 64 * 1024) {
           return;
         }
 
@@ -7747,7 +7847,7 @@ class ClassroomManager {
       this.webrtcManager.closeConnection(studentId);
     }
     if (this.onStudentLeft) {
-      this.onStudentLeft(studentId);
+      this.onStudentLeft(studentId, true);
     }
     if (typeof showToast === 'function') {
       showToast('Student removed from classroom session.', 'info');
@@ -8625,6 +8725,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       startSessionTimer();
       if (signaling.pendingRemoteStream) {
         activateRemoteVideoStream(signaling.pendingRemoteStream);
+      } else if (signaling.teacherConn && signaling.teacherConn.open) {
+        try {
+          signaling.teacherConn.send({
+            type: 'request_stream',
+            senderId: signaling.clientId,
+            roomCode: classroom.sessionCode
+          });
+          console.log('[App] Sent request_stream to professor via manual stage entry');
+        } catch(e) {}
       }
       showToast('Entered Amrita classroom stage!', 'success');
     });
@@ -8885,21 +8994,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   function activateRemoteVideoStream(stream) {
     const studentVideo = document.getElementById('studentRemoteVideo');
     const emptyState = document.getElementById('studentStreamEmptyState');
+    const canvas = document.getElementById('studentFallbackCanvas');
+    if (!stream) return;
 
-    // GUARD: If stream is null or has no video tracks, DO NOT hide the empty state and DO NOT show black box!
-    if (!stream || typeof stream.getVideoTracks !== 'function' || stream.getVideoTracks().length === 0) {
-      console.log('[Video] Stream has no active video tracks. Retaining stage empty state.');
-      if (emptyState) emptyState.style.setProperty('display', 'flex', 'important');
-      if (studentVideo) {
-        studentVideo.style.setProperty('display', 'none', 'important');
-        studentVideo.srcObject = null;
+    // Attach dynamic listener for video track arrival (in case audio track arrived first)
+    if (typeof stream.addEventListener === 'function') {
+      stream.onaddtrack = () => {
+        console.log('[Video] Track added dynamically to stream:', stream.getTracks().map(t => t.kind));
+        activateRemoteVideoStream(stream);
+      };
+    }
+
+    const videoTracks = typeof stream.getVideoTracks === 'function' ? stream.getVideoTracks() : [];
+    if (videoTracks.length === 0) {
+      console.log('[Video] Stream has no video tracks yet. Waiting for track...');
+      if (studentVideo && studentVideo.srcObject !== stream) {
+        studentVideo.srcObject = stream;
       }
       return;
     }
 
-    if (emptyState) {
-      emptyState.style.setProperty('display', 'none', 'important');
-    }
+    // Video tracks are present!
+    if (emptyState) emptyState.style.setProperty('display', 'none', 'important');
+    if (canvas) canvas.style.setProperty('display', 'none', 'important');
 
     if (studentVideo) {
       studentVideo.style.setProperty('display', 'block', 'important');
@@ -8986,6 +9103,16 @@ document.addEventListener('DOMContentLoaded', async () => {
       activateRemoteVideoStream(signaling.pendingRemoteStream);
     } else if (studentRemoteVideo && studentRemoteVideo.srcObject) {
       activateRemoteVideoStream(studentRemoteVideo.srcObject);
+    } else if (signaling.teacherConn && signaling.teacherConn.open) {
+      // Request active presentation call from professor in case professor started presenting before approval
+      try {
+        signaling.teacherConn.send({
+          type: 'request_stream',
+          senderId: signaling.clientId,
+          roomCode: classroom.sessionCode
+        });
+        console.log('[App] Sent request_stream to professor on admission approval');
+      } catch(e) {}
     }
   };
 
@@ -9015,6 +9142,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
       studentRemoteVideo.srcObject = null;
       studentRemoteVideo.style.setProperty('display', 'none', 'important');
+    }
+    if (studentFallbackCanvas) {
+      studentFallbackCanvas.style.setProperty('display', 'none', 'important');
+      if (studentFallbackCtx) studentFallbackCtx.clearRect(0, 0, studentFallbackCanvas.width, studentFallbackCanvas.height);
     }
     const emptyState = document.getElementById('studentStreamEmptyState');
     if (emptyState) emptyState.style.setProperty('display', 'flex', 'important');
@@ -9094,10 +9225,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
   }
 
-  classroom.onStudentLeft = (studentId) => {
+  classroom.onStudentLeft = (studentId, isKicked = false) => {
     if (studentId) {
       sessionAttendance.forEach((rec, key) => {
-        if (rec.id === studentId) rec.status = 'Disconnected';
+        if (rec.id === studentId) rec.status = isKicked ? 'Removed' : 'Disconnected';
       });
       renderAttendanceTable();
     }
@@ -9400,8 +9531,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   signaling.onStreamStarted = () => {
     if (classroom.role !== 'teacher') {
       showToast('Presenter started screen sharing!', 'info');
-      setStreamEngine('webrtc');
-      if (studentRemoteVideo) studentRemoteVideo.play().catch(() => {});
+      if (signaling.pendingRemoteStream) {
+        activateRemoteVideoStream(signaling.pendingRemoteStream);
+      } else if (signaling.teacherConn && signaling.teacherConn.open) {
+        try {
+          signaling.teacherConn.send({
+            type: 'request_stream',
+            senderId: signaling.clientId,
+            roomCode: classroom.sessionCode
+          });
+          console.log('[App] Sent request_stream to professor');
+        } catch(e) {}
+      }
     }
   };
 
@@ -9587,6 +9728,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       headerStatusText.textContent = m.classification.label;
       headerLatencyPill.style.display = 'flex';
       headerLatencyVal.textContent = `${m.rttMs}ms`;
+    } else if (classroom.isApproved && (currentStreamEngine === 'sfu' || (signaling.teacherConn && signaling.teacherConn.open))) {
+      headerStatusDot.className = 'status-dot active';
+      headerStatusText.textContent = currentStreamEngine === 'sfu' ? 'DataChannel Relay' : 'Classroom Connected';
+      headerLatencyPill.style.display = 'none';
     } else if (m.iceConnectionState === 'failed') {
       headerStatusDot.className = 'status-dot error';
       headerStatusText.textContent = 'Failed';
@@ -9606,10 +9751,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     teacherBannerClassification.textContent = m.classification.code || 'PENDING';
 
     // Student Stage HUD
-    studentHudPathBadge.textContent = m.classification.label;
-    studentHudRes.textContent = m.frameWidth > 0 ? `${m.frameWidth}x${m.frameHeight}` : '--';
-    studentHudFps.textContent = m.framesPerSecond > 0 ? `${m.framesPerSecond} FPS` : '--';
-    studentHudRtt.textContent = `${m.rttMs}ms`;
+    if (currentStreamEngine === 'sfu') {
+      studentHudPathBadge.textContent = 'DataChannel Relay';
+      studentHudPathBadge.className = 'badge-classification badge-lan';
+    } else if (m.classification && m.classification.label && (m.iceConnectionState === 'connected' || m.iceConnectionState === 'completed')) {
+      studentHudPathBadge.textContent = m.classification.label;
+      studentHudPathBadge.className = `badge-classification ${m.classification.badgeClass || 'badge-pending'}`;
+    }
+    if (m.frameWidth > 0) studentHudRes.textContent = `${m.frameWidth}x${m.frameHeight}`;
+    if (m.framesPerSecond > 0) studentHudFps.textContent = `${m.framesPerSecond} FPS`;
+    if (m.rttMs > 0) studentHudRtt.textContent = `${m.rttMs}ms`;
 
     // Teacher Diagnostics Table
     diagClassificationBadge.className = `badge-classification ${m.classification.badgeClass || 'badge-pending'}`;
