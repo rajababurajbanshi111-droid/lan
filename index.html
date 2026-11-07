@@ -2439,7 +2439,7 @@ body {
                 </h4>
                 <div style="display: flex; gap: 0.5rem; align-items: center;">
                   <label style="display: flex; align-items: center; gap: 0.35rem; font-size: 0.75rem; color: var(--accent-cyan); cursor: pointer; margin-right: 0.25rem;">
-                    <input type="checkbox" id="teacherAutoApproveCheck" style="cursor: pointer;">
+                    <input type="checkbox" id="teacherAutoApproveCheck" checked style="cursor: pointer;">
                     <span>Auto-Approve</span>
                   </label>
                   <button class="btn btn-success" style="padding: 0.35rem 0.65rem; font-size: 0.75rem;" id="approveAllBtn">Approve All</button>
@@ -4872,10 +4872,31 @@ class SignalingManager {
       config: {
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+          { urls: 'stun:stun.services.mozilla.com' },
           { urls: 'stun:global.stun.twilio.com:3478' }
         ]
       }
     };
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.peer && this.peer.socket && this.peer.socket._ws && this.peer.socket._ws.readyState === WebSocket.OPEN) {
+        try { this.peer.socket._ws.send(JSON.stringify({ type: 'HEARTBEAT' })); } catch(e) {}
+      }
+    }, 15000);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
   }
 
   // Teacher initializes classroom
@@ -4897,6 +4918,7 @@ class SignalingManager {
       this.peer.on('open', (id) => {
         console.log('[Signaling] Teacher PeerJS session active with ID:', id);
         this.isConnected = true;
+        this.startHeartbeat();
         if (this.onServerStatusChange) this.onServerStatusChange(true, 'PeerJS Serverless (Port 443)');
         if (this.onRoomCreated) {
           this.onRoomCreated({
@@ -4909,9 +4931,28 @@ class SignalingManager {
 
       this.peer.on('connection', (conn) => {
         console.log('[Signaling] Student incoming connection:', conn.peer);
+        this.studentConnections.set(conn.peer, conn);
+
+        // Immediate admission trigger: Process metadata sent during peer.connect handshake!
+        if (conn.metadata && conn.metadata.studentName) {
+          this.handleIncomingMessage({
+            type: 'room_join_request',
+            senderId: conn.peer,
+            studentName: conn.metadata.studentName,
+            roomCode: this.currentRoomCode
+          }, conn.peer);
+        }
 
         conn.on('open', () => {
           this.studentConnections.set(conn.peer, conn);
+          console.log('[Signaling] Data channel opened with student:', conn.peer);
+          // If teacher is presenting, immediately ensure stream is dispatched
+          if (this.activeStream) {
+            try {
+              const call = this.peer.call(conn.peer, this.activeStream);
+              this.mediaCalls.set(conn.peer, call);
+            } catch(e) {}
+          }
         });
 
         conn.on('data', (data) => {
@@ -4979,6 +5020,7 @@ class SignalingManager {
         console.log('[Signaling] Student PeerJS ready with ID:', myId);
         this.clientId = myId;
         this.isConnected = true;
+        this.startHeartbeat();
         if (this.onServerStatusChange) this.onServerStatusChange(true, 'PeerJS Serverless (Port 443)');
 
         const teacherPeerId = 'smartclass-room-' + this.currentRoomCode + '-teacher';
@@ -4991,7 +5033,19 @@ class SignalingManager {
 
         this.teacherConn = conn;
 
+        let channelOpened = false;
+        const fallbackTimer = setTimeout(() => {
+          if (!channelOpened && (!conn || !conn.open)) {
+            console.warn('[Signaling] Connection taking longer than expected. Retrying handshake...');
+            if (typeof showToast === 'function') {
+              showToast('Connecting to room ' + this.currentRoomCode + '... Ensure teacher is active.', 'info');
+            }
+          }
+        }, 5000);
+
         conn.on('open', () => {
+          channelOpened = true;
+          clearTimeout(fallbackTimer);
           console.log('[Signaling] Data channel connected to teacher! Sending join request...');
           conn.send({
             type: 'room_join_request',
@@ -5032,10 +5086,16 @@ class SignalingManager {
         call.on('stream', (remoteStream) => {
           console.log('[Signaling] Remote screen stream attached with', remoteStream.getTracks().length, 'tracks');
           const studentVideo = document.getElementById('studentRemoteVideo');
+          const emptyState = document.getElementById('studentStreamEmptyState');
+          if (emptyState) emptyState.style.display = 'none';
           if (studentVideo) {
             studentVideo.srcObject = remoteStream;
             studentVideo.muted = true;
-            studentVideo.play().catch(() => {});
+            studentVideo.play().then(() => {
+              console.log('[Signaling] Video stream playback started successfully.');
+            }).catch((err) => {
+              console.warn('[Signaling] Autoplay blocked, user click required:', err);
+            });
           }
           if (typeof setStreamEngine === 'function') {
             setStreamEngine('webrtc');
@@ -8201,19 +8261,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // --- 10. Unified Student Join Workflow (Session Code Only) ---
   studentSubmitJoinBtn.addEventListener('click', () => {
-    const code = studentRoomCodeInput.value.trim();
+    let rawCode = studentRoomCodeInput.value || '';
+    const code = rawCode.trim().replace(/[^0-9]/g, '');
     const name = studentDisplayNameInput.value.trim() || 'Student';
 
     if (!code || code.length !== 6) {
-      return showToast('Please enter a valid 6-digit session code.', 'warning');
+      return showToast('Please enter a valid 6-digit session code (e.g. 482913).', 'warning');
     }
 
+    studentRoomCodeInput.value = code;
     storage.saveUserProfile({ displayName: name, role: 'student' });
     classroom.requestJoin(code, name);
 
     studentAutoJoinForm.style.display = 'none';
     studentWaitingApprovalBox.style.display = 'block';
-    showToast(`Session code ${code} submitted! Connecting to classroom...`, 'info');
+    showToast(`Connecting to room ${code}... Please wait.`, 'info');
   });
 
   const studentCancelWaitBtn = document.getElementById('studentCancelWaitBtn');
