@@ -161,6 +161,7 @@ body {
 
 .amrita-floating-emoji {
   position: absolute;
+  bottom: 0px;
   font-size: 2.8rem;
   animation: amritaFloatUp 2.2s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
   filter: drop-shadow(0 4px 12px rgba(0, 0, 0, 0.5));
@@ -5051,13 +5052,7 @@ class SignalingManager {
         conn.on('open', () => {
           this.studentConnections.set(conn.peer, conn);
           console.log('[Signaling] Data channel opened with student:', conn.peer);
-          // If teacher is presenting, immediately ensure stream is dispatched
-          if (this.activeStream) {
-            try {
-              const call = this.peer.call(conn.peer, this.activeStream);
-              this.mediaCalls.set(conn.peer, call);
-            } catch(e) {}
-          }
+          // Media stream will be dispatched only after explicit admission approval!
         });
 
         conn.on('data', (data) => {
@@ -5183,33 +5178,54 @@ class SignalingManager {
         });
       });
 
-      // Handle incoming screen/audio call from teacher
+      // Handle incoming screen presentation call from teacher
       this.peer.on('call', (call) => {
-        console.log('[Signaling] Incoming media call from teacher:', call.peer);
-        call.answer(); // Viewer answers without stream
+        console.log('[Signaling] Incoming presentation call from teacher:', call.peer);
+        call.answer(); // Viewer answers call without stream
 
         call.on('stream', (remoteStream) => {
-          console.log('[Signaling] Remote screen stream attached with', remoteStream.getTracks().length, 'tracks');
+          console.log('[Signaling] Presentation stream received! Tracks:', remoteStream.getTracks().length);
           const studentVideo = document.getElementById('studentRemoteVideo');
           const emptyState = document.getElementById('studentStreamEmptyState');
-          if (emptyState) emptyState.style.display = 'none';
-          if (studentVideo) {
-            studentVideo.srcObject = remoteStream;
-            studentVideo.muted = true;
-            studentVideo.play().then(() => {
-              console.log('[Signaling] Video stream playback started successfully.');
-            }).catch((err) => {
-              console.warn('[Signaling] Autoplay blocked, user click required:', err);
-            });
-          }
-          if (typeof setStreamEngine === 'function') {
-            setStreamEngine('webrtc');
-          }
-          if (window.webrtc && typeof window.webrtc.onRemoteTrack === 'function') {
-            const videoTrack = remoteStream.getVideoTracks()[0];
-            if (videoTrack) {
-              window.webrtc.onRemoteTrack(call.peer, remoteStream, videoTrack);
+
+          if (classroom.isApproved) {
+            if (emptyState) {
+              emptyState.style.setProperty('display', 'none', 'important');
             }
+            if (studentVideo) {
+              studentVideo.style.setProperty('display', 'block', 'important');
+              studentVideo.srcObject = remoteStream;
+              studentVideo.muted = true;
+              
+              const p = studentVideo.play();
+              if (p !== undefined) {
+                p.catch((err) => {
+                  console.warn('[Signaling] Autoplay was blocked by browser. User click to play enabled:', err);
+                });
+              }
+            }
+            if (typeof setStreamEngine === 'function') {
+              setStreamEngine('webrtc');
+            }
+            if (typeof showToast === 'function') {
+              showToast('Amrita Live Screen Stream is active in HD!', 'success');
+            }
+          }
+        });
+
+        call.on('close', () => {
+          console.log('[Signaling] Presentation call closed by teacher');
+          const studentVideo = document.getElementById('studentRemoteVideo');
+          const emptyState = document.getElementById('studentStreamEmptyState');
+          if (studentVideo) {
+            if (studentVideo.srcObject) {
+              studentVideo.srcObject.getTracks().forEach(t => t.stop());
+            }
+            studentVideo.srcObject = null;
+            studentVideo.style.setProperty('display', 'none', 'important');
+          }
+          if (emptyState) {
+            emptyState.style.setProperty('display', 'flex', 'important');
           }
         });
 
@@ -5298,15 +5314,51 @@ class SignalingManager {
     return true;
   }
 
-  // Teacher rejects student
-  rejectStudent(studentId, reason = 'Teacher rejected join request') {
+  // Teacher rejects student admission request
+  rejectStudent(studentId, reason = 'Professor declined admission request.') {
     const conn = this.studentConnections.get(studentId);
-    if (conn && conn.open) {
-      conn.send({
-        type: 'room_join_rejected',
-        reason: reason,
-        recipientId: studentId
-      });
+    if (conn) {
+      try {
+        conn.send({
+          type: 'room_join_rejected',
+          reason: reason,
+          recipientId: studentId
+        });
+        setTimeout(() => {
+          try { conn.close(); } catch(e) {}
+        }, 400);
+      } catch(e) {}
+    }
+    this.studentConnections.delete(studentId);
+    return true;
+  }
+
+  // Teacher kicks/removes an admitted student
+  kickStudent(studentId, reason = 'You have been removed from the classroom by the professor.') {
+    console.log('[Signaling] Kicking student:', studentId);
+
+    // 1. Immediately terminate media call so screen sharing stops instantly on student!
+    if (this.mediaCalls.has(studentId)) {
+      try {
+        const call = this.mediaCalls.get(studentId);
+        call.close();
+      } catch(e) {}
+      this.mediaCalls.delete(studentId);
+    }
+
+    // 2. Send kick notification over data channel
+    const conn = this.studentConnections.get(studentId);
+    if (conn) {
+      try {
+        conn.send({
+          type: 'student_kicked',
+          reason: reason,
+          recipientId: studentId
+        });
+        setTimeout(() => {
+          try { conn.close(); } catch(e) {}
+        }, 400);
+      } catch(e) {}
     }
     this.studentConnections.delete(studentId);
     return true;
@@ -5317,15 +5369,20 @@ class SignalingManager {
     this.activeStream = stream;
     if (!this.peer) return;
 
-    console.log('[Signaling] Initiating media calls to ' + this.studentConnections.size + ' students...');
+    console.log('[Signaling] Broadcasting presentation stream to admitted students...');
     this.studentConnections.forEach((conn, studentId) => {
+      // ONLY dispatch to admitted students!
+      if (window.classroom && window.classroom.connectedStudents && !window.classroom.connectedStudents.has(studentId)) {
+        console.log('[Signaling] Skipping unadmitted student during screen broadcast:', studentId);
+        return;
+      }
       try {
         if (this.mediaCalls.has(studentId)) {
           try { this.mediaCalls.get(studentId).close(); } catch(e) {}
         }
+        console.log('[Signaling] Presentation call dispatched to admitted student:', studentId);
         const call = this.peer.call(studentId, stream);
         this.mediaCalls.set(studentId, call);
-        console.log('[Signaling] Presentation call dispatched to student:', studentId);
       } catch (e) {
         console.warn('[Signaling] Failed to call student ' + studentId + ':', e);
       }
@@ -5391,7 +5448,7 @@ class SignalingManager {
 
     // If teacher receives student message, relay broadcast types to all other students
     if (this.role === 'teacher' && fromPeer) {
-      const shouldRelay = ['chat_message', 'reaction', 'wb_stroke', 'wb_clear'].includes(msg.type);
+      const shouldRelay = ['chat_message', 'reaction', 'wb_stroke', 'wb_clear', 'announcement', 'raise_hand'].includes(msg.type);
       if (shouldRelay) {
         this.studentConnections.forEach((conn) => {
           if (conn.peer !== fromPeer && conn.open) {
@@ -5417,6 +5474,11 @@ class SignalingManager {
 
       case 'room_terminated':
         if (this.onRoomTerminated) this.onRoomTerminated(msg);
+        break;
+
+      case 'student_kicked':
+        console.warn('[Signaling] Student received kick notice:', msg.reason);
+        if (this.onStudentKicked) this.onStudentKicked(msg);
         break;
 
       case 'signal_offer':
@@ -7510,18 +7572,8 @@ class ClassroomManager {
       this.onStudentApproved(student);
     }
 
-    // Teacher initiates WebRTC connection offer to the approved student
-    if (this.webrtcManager) {
-      this.webrtcManager.createOffer(studentId).then((offer) => {
-        if (this.signalingManager && this.signalingManager.isConnected) {
-          this.signalingManager.send({
-            type: 'signal_offer',
-            recipientId: studentId,
-            payload: offer
-          });
-        }
-      });
-    }
+    // PeerJS exclusively manages the media call and data channels with zero conflicts!
+    console.log('[Classroom] Approved student admission:', studentId);
 
     return true;
   }
@@ -7537,10 +7589,13 @@ class ClassroomManager {
   /**
    * Teacher rejects a pending student
    */
-  rejectStudent(studentId, reason = 'Teacher rejected your request') {
+  rejectStudent(studentId, reason = 'Professor declined admission request.') {
     this.pendingApprovals.delete(studentId);
     if (this.signalingManager && this.signalingManager.isConnected) {
       this.signalingManager.rejectStudent(studentId, reason);
+    }
+    if (typeof renderPendingApprovals === 'function') {
+      renderPendingApprovals();
     }
   }
 
@@ -7557,17 +7612,20 @@ class ClassroomManager {
    */
   kickStudent(studentId) {
     this.connectedStudents.delete(studentId);
+    if (this.signalingManager) {
+      this.signalingManager.kickStudent(studentId, 'You have been removed from the classroom by the professor.');
+    }
     if (this.webrtcManager) {
       this.webrtcManager.closeConnection(studentId);
     }
-    if (this.signalingManager && this.signalingManager.isConnected) {
-      this.signalingManager.send({
-        type: 'student_kick',
-        recipientId: studentId
-      });
-    }
     if (this.onStudentLeft) {
       this.onStudentLeft(studentId);
+    }
+    if (typeof showToast === 'function') {
+      showToast('Student removed from classroom session.', 'info');
+    }
+    if (typeof renderConnectedRoster === 'function') {
+      renderConnectedRoster();
     }
   }
 
@@ -7999,7 +8057,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       viewStudent.classList.add('active');
       userRoleBadge.textContent = 'Student';
       userRoleBadge.className = 'role-badge';
-      if (classroom.isSessionActive) {
+      if (classroom.isApproved && classroom.isSessionActive) {
         studentJoinScreen.style.display = 'none';
         studentClassroomScreen.style.display = 'flex';
         headerRoomPill.style.display = 'flex';
@@ -8488,13 +8546,15 @@ document.addEventListener('DOMContentLoaded', async () => {
       studentRemoteVideo.srcObject.addTrack(track);
     }
 
-    classroom.isSessionActive = true;
-    if (classroom.sessionCode) {
-      updateRoomCodeDisplay(classroom.sessionCode);
-    }
-    if (currentView !== 'student' || studentClassroomScreen.style.display === 'none') {
-      switchView('student');
-      startSessionTimer();
+    if (classroom.isApproved) {
+      classroom.isSessionActive = true;
+      if (classroom.sessionCode) {
+        updateRoomCodeDisplay(classroom.sessionCode);
+      }
+      if (currentView !== 'student' || studentClassroomScreen.style.display === 'none') {
+        switchView('student');
+        startSessionTimer();
+      }
     }
 
     if (track.kind === 'video') {
@@ -8676,26 +8736,63 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateRoomCodeDisplay(confirmedCode);
   };
 
-  // Student receives join approval from teacher
+  // Student receives join approval from professor
   signaling.onJoinApproved = (msg) => {
-    // PROTECT TEACHER: Teacher never processes join approval as a student
     if (classroom.role === 'teacher') return;
 
-    console.log('[App] Join approved by teacher:', msg);
+    console.log('[App] Join approved by professor:', msg);
+    classroom.isApproved = true;
     classroom.isSessionActive = true;
     classroom.sessionCode = msg.roomCode;
     updateRoomCodeDisplay(msg.roomCode);
     studentWaitingApprovalBox.style.display = 'none';
     switchView('student');
     startSessionTimer();
-    showToast('Teacher approved your admission! Connecting media stream...', 'success');
+    showToast('🎓 Professor approved your admission! Welcome to Amrita Live Stage.', 'success');
+
+    // If stream already arrived while waiting, ensure video is displayed and empty state is hidden
+    if (studentRemoteVideo && studentRemoteVideo.srcObject) {
+      const emptyState = document.getElementById('studentStreamEmptyState');
+      if (emptyState) emptyState.style.setProperty('display', 'none', 'important');
+      studentRemoteVideo.style.setProperty('display', 'block', 'important');
+      studentRemoteVideo.muted = true;
+      studentRemoteVideo.play().catch(() => {});
+    }
   };
 
   // Student receives join rejection
   signaling.onJoinRejected = (msg) => {
+    if (classroom.role === 'teacher') return;
+    classroom.isApproved = false;
+    classroom.isSessionActive = false;
     studentWaitingApprovalBox.style.display = 'none';
     studentAutoJoinForm.style.display = 'flex';
-    showToast(msg.reason || 'Teacher declined admission request.', 'warning');
+    showToast(msg.reason || 'Professor declined admission request.', 'error');
+  };
+
+  // Student receives kick command from professor -> Broadcast terminates immediately!
+  signaling.onStudentKicked = (msg) => {
+    if (classroom.role === 'teacher') return;
+    console.warn('[App] Student was kicked by professor:', msg);
+
+    classroom.isApproved = false;
+    classroom.isSessionActive = false;
+    classroom.sessionCode = null;
+
+    // Immediately stop video stream and tracks
+    if (studentRemoteVideo) {
+      if (studentRemoteVideo.srcObject) {
+        studentRemoteVideo.srcObject.getTracks().forEach(t => t.stop());
+      }
+      studentRemoteVideo.srcObject = null;
+      studentRemoteVideo.style.setProperty('display', 'none', 'important');
+    }
+    const emptyState = document.getElementById('studentStreamEmptyState');
+    if (emptyState) emptyState.style.setProperty('display', 'flex', 'important');
+
+    // Switch view back to gateway
+    switchView('landing');
+    showToast(msg.reason || 'You have been removed from the classroom by the professor.', 'warning');
   };
 
   // Classroom terminated by host
@@ -8792,15 +8889,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         payload: answer
       });
 
-      // PROTECT TEACHER: Never switch teacher view on incoming renegotiation/ICE restart offer!
-      if (classroom.role !== 'teacher') {
+      // PROTECT TEACHER & RESPECT ADMISSION GUARD: Do NOT switch view until explicitly approved
+      if (classroom.role !== 'teacher' && classroom.isApproved) {
         classroom.isSessionActive = true;
         if (classroom.sessionCode) {
           updateRoomCodeDisplay(classroom.sessionCode);
         }
         switchView('student');
         startSessionTimer();
-        showToast('Teacher approved your admission! Connecting media stream...', 'success');
       }
     } catch (err) {
       console.error('Error handling signal_offer:', err);
@@ -8838,29 +8934,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   };
 
-  // WebRTC Connection State Listener
+  // WebRTC Connection State Listener (Strict Admission Guard - No premature join!)
   webrtc.onConnectionStateChange = (peerId, state) => {
     console.log(`[WebRTC] Peer ${peerId} state:`, state);
-    if (classroom.role === 'teacher') return;
-    if (state === 'connected') {
-      if (currentView === 'student' && !classroom.isSessionActive) {
-        classroom.isSessionActive = true;
-        switchView('student');
-        startSessionTimer();
-      }
-    }
   };
 
   webrtc.onIceStateChange = (peerId, iceState) => {
     console.log(`[WebRTC] Peer ${peerId} ICE state:`, iceState);
-    if (classroom.role === 'teacher') return;
-    if (iceState === 'connected' || iceState === 'completed') {
-      if (currentView === 'student' && !classroom.isSessionActive) {
-        classroom.isSessionActive = true;
-        switchView('student');
-        startSessionTimer();
-      }
-    }
   };
 
   // Render Roster & Pending Lists
